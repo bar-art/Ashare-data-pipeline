@@ -122,15 +122,11 @@ pytest
 
 测试不联网。核心代码覆盖率要求80%。架构、签名和数据流见 [设计](docs/design.md)。`config/market_rules.yaml` 是禁止用于回测的草案，第二阶段核验历史规则后启用。
 
-## 后续命令规划（当前不可执行）
+## 后续计划
 
-第三阶段再增加 `quant-agent backtest --config ...`；第六阶段再增加 `quant-agent research --question "中证1000内低换手因子2018年以来的表现"`。当前 CLI 支持 fetch/calendar/instruments/export，无实盘接口。
+回测、组合与大模型研究在独立项目 [quant-research-lab](https://github.com/bar-art/quant-research-lab) 中完成；本项目专注于可核对的数据。仍待补充：未完成股权分置改革的 S 股 5% 涨跌停规则、主板新股上市首日（2023-04-10 前）的发行价规则、公告日口径的财务数据。
 
-本阶段验收按用户确认调整为“框架 + 小样本 + 缺口说明”，不是“2015年至今全市场含退市股已完成”。每阶段结束后等待确认再继续。
-
-## 本机已准备好的环境
-
-本机 `.venv` 已配置 Python 3.11，可直接 `source .venv/bin/activate`。独立运行时位于 `.python/`，不修改系统 Python；这些目录均不提交。第一阶段结果见 [验收记录](docs/phase1_acceptance.md)。
+开发环境：Python 3.11，`.venv/`、`.python/` 等本地环境目录不提交。第一阶段的范围与验收记录见 [设计](docs/design.md) 和 [验收记录](docs/phase1_acceptance.md)。
 
 ## 历史指数成分快照（2026-11-25）
 

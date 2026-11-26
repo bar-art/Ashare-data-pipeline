@@ -1,4 +1,4 @@
-"""检查 Tushare 连接：按接口方说明的初始化方式调用，卡号与地址从 .env 读取；不打印卡号。"""
+"""检查 Tushare 连接：token 与可选接口地址从 .env 读取；不打印 token。"""
 
 from datetime import date
 
