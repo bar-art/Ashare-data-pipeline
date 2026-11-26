@@ -1,0 +1,18 @@
+# 完整传递依赖版本由 Python 3.11 环境生成 requirements.lock。
+pandas
+numpy
+pyarrow
+duckdb
+pydantic-settings
+pyyaml
+akshare
+baostock
+tushare
+yfinance
+pytest
+pytest-cov
+mypy
+ruff
+pandas-stubs
+types-PyYAML
+setuptools

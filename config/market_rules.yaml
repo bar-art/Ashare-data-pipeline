@@ -1,0 +1,40 @@
+# 第一阶段配置草案，非可执行交易规则。第二阶段须核对各板块历史生效区间。
+status: draft_not_for_backtest
+reviewed_at: '2026-11-19'
+settlement:
+  sell_delay_sessions: 1
+price_limits_draft:
+  main: 0.10
+  main_st: 0.05  # 2026-07-06 起为 0.10；已在 quant_agent/data/rules.py 实现并测试
+  chinext: 0.20
+  star: 0.20
+  beijing: 0.30
+  ipo_exempt_sessions: null  # 各市场各日期单独核验，不采用统一值
+lot_sizes_draft:
+  main: {minimum: 100, increment: 100}
+  star: {minimum: 200, increment: 1}
+  beijing: {minimum: null, increment: null}
+  sell_odd_lot_once: true
+costs:
+  commission: {rate: 0.00025, minimum_cny: 5, sides: both, source: user_assumption}
+  slippage_bps: 5  # 研究假设，不是法定费率
+  stamp_tax:
+    side: sell
+    periods:
+      - {start: '2015-01-01', end: '2023-08-27', rate: 0.001, status: pending_historical_verification}
+      - {start: '2023-08-28', end: null, rate: 0.0005, status: reduction_verified_latest_validity_pending}
+    source: https://fgk.chinatax.gov.cn/zcfgk/c102416/c5211343/content.html
+  transfer_fee_periods: []  # 未核验，禁止默认为0；第二阶段补足历史区间
+execution:
+  suspended: no_fill
+  locked_up_limit: no_buy
+  locked_down_limit: no_sell
+  valuation_on_suspension: last_available_price
+prices:
+  execution: raw
+  return_calculation: adjusted_with_point_in_time_corporate_actions
+  unknown_adjustment_factor: block_backtest
+universe:
+  historical_membership_required: true
+  include_delisted: true
+  unknown_st_status: block_filter
