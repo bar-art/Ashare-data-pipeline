@@ -1,10 +1,12 @@
 """命令行：BaoStock 或 Tushare 本地快照提供昨收、停牌、ST 与复权因子，并可导出到下游研究项目。"""
 
 import argparse
+import hashlib
 import json
 from datetime import date
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import pandas as pd
 
@@ -22,7 +24,7 @@ from quant_agent.data.providers import (
 from quant_agent.data.quality import DISCLAIMER, markdown_report, quality_report
 from quant_agent.data.rules import apply_price_limits
 from quant_agent.data.service import DataService
-from quant_agent.data.tushare_snapshot import TushareSnapshotProvider, download
+from quant_agent.data.tushare_snapshot import TushareSnapshotProvider, download, migrate_legacy
 from quant_agent.data.tushare_source import TushareSource
 from quant_agent.data.universe import load_snapshots, membership, monthly_snapshot_dates
 from quant_agent.data.yahoo_source import YahooSource
@@ -33,8 +35,18 @@ INDEX_CODES = {"hs300": "399300.SZ"}
 
 def run_snapshot(args: argparse.Namespace, settings: Settings) -> None:
     """联网下载 Tushare 原始数据到本地快照；之后 --provider tushare 离线读取。"""
+    if args.migrate:
+        manifest = migrate_legacy(settings.tushare_snapshot_dir)
+        print(
+            f"已为旧快照建立核验清单：{manifest['files']} 个文件，"
+            f"完整性自 {manifest['integrity_established_at']} 起可核验（legacy）"
+        )
+        return
     if args.index not in INDEX_CODES:
         raise ValueError(f"snapshot 目前支持 {sorted(INDEX_CODES)}")
+    # 计划里只记接口主机的哈希：能区分不同来源，又不写入地址本身。
+    host = urlsplit(settings.tushare_http_url).hostname or "api.tushare.pro"
+    endpoint_digest = hashlib.sha256(host.encode()).hexdigest()[:16]
     gate = RequestGate(settings.request_interval, settings.request_attempts)
     source = TushareSource(
         settings.tushare_token.get_secret_value(), settings.tushare_http_url, gate
@@ -46,6 +58,7 @@ def run_snapshot(args: argparse.Namespace, settings: Settings) -> None:
         args.start,
         args.end,
         source.source,
+        endpoint_digest=endpoint_digest,
     )
     print(f"快照完成：{len(manifest['codes'])} 只历史成分股；目录 {settings.tushare_snapshot_dir}")
 
@@ -234,6 +247,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--universe-file", type=Path, help="export：universe 命令输出的成分快照")
     parser.add_argument(
         "--skip-unavailable", action="store_true", help="export：跳过取不到行情的证券并记录"
+    )
+    parser.add_argument(
+        "--migrate",
+        action="store_true",
+        help="snapshot：为旧格式快照离线建立核验清单（标记 legacy），不联网",
     )
     parser.add_argument(
         "--allow-gap-placeholders",

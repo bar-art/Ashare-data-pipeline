@@ -18,6 +18,7 @@ token 有有效期；落盘后结果可复现，不依赖账号是否仍可用�
   - 停牌行沿用停牌前最后成交日的复权因子（停牌期间除权的因子变化落在复牌日）。
 """
 
+import hashlib
 import json
 from collections.abc import Callable
 from datetime import date, datetime
@@ -31,6 +32,7 @@ from quant_agent.data.schema import normalize
 PER_CODE = ["daily", "adj_factor", "stk_limit", "suspend_d", "namechange"]
 INDEXES = {"hs300": "399300.SZ"}
 ST_PREFIXES = ("ST", "*ST", "S*ST", "SST")
+STOCK_BASIC_FIELDS = "ts_code,symbol,name,market,exchange,list_status,list_date,delist_date"
 
 
 def _ymd(day: date) -> str:
@@ -41,6 +43,135 @@ def _parse(column: pd.Series) -> pd.Series:
     return pd.to_datetime(column.astype("string"), format="%Y%m%d", errors="coerce")
 
 
+FORMAT_VERSION = 2
+# 单次返回接近接口上限时可能被截断（Tushare 日线类接口单次上限约 6000 行）。
+TRUNCATION_ROWS = 5000
+# 各接口单次调用空结果的含义：True 表示合法（例如区间内没有停牌、没有暂停上市的证券）；
+# False 表示必须报错（例如某个月没有指数权重即为缺月）。
+EMPTY_ALLOWED = {
+    "trade_cal": False,
+    "stock_basic": True,  # 按上市状态分三次查询，单次可为空，合并后不得为空
+    "index_weight": False,
+    "daily": True,  # 区间内未上市或已退市
+    "adj_factor": True,
+    "stk_limit": True,
+    "suspend_d": True,
+    "namechange": True,
+}
+NONEMPTY_TOTAL = {"trade_cal", "stock_basic", "index_weight"}
+DATE_COLUMN = {
+    "trade_cal": "cal_date",
+    "index_weight": "trade_date",
+    "daily": "trade_date",
+    "adj_factor": "trade_date",
+    "stk_limit": "trade_date",
+    "suspend_d": "trade_date",
+}
+KEYS = {
+    "trade_cal": ["cal_date"],
+    "stock_basic": ["ts_code"],
+    "index_weight": ["trade_date", "con_code"],
+    "daily": ["trade_date"],
+    "adj_factor": ["trade_date"],
+    "stk_limit": ["trade_date"],
+    "suspend_d": ["trade_date", "suspend_type"],
+}
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _write_json(path: Path, value: dict[str, Any]) -> None:
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.replace(path)
+
+
+def make_plan(
+    index_code: str, start: date, end: date, source_label: str, endpoint_digest: str
+) -> dict[str, Any]:
+    """首次下载前固定的计划；参数变化必须换新目录。不含 token。"""
+    return {
+        "format_version": FORMAT_VERSION,
+        "source_label": source_label,
+        "endpoint_digest": endpoint_digest,
+        "index_code": index_code,
+        "start": start.isoformat(),
+        "end": end.isoformat(),
+        "datasets": ["trade_cal", "stock_basic", "index_weight", *PER_CODE],
+        "stock_basic_fields": STOCK_BASIC_FIELDS,
+    }
+
+
+def check_result(api: str, frame: pd.DataFrame, params: dict[str, Any]) -> list[str]:
+    """返回结果的诊断：空表语义、可能截断、重复键、区间外日期。"""
+    problems = []
+    if frame.empty:
+        if not EMPTY_ALLOWED[api]:
+            problems.append(f"{api} 返回空表，该接口不允许为空")
+        return problems
+    if len(frame) >= TRUNCATION_ROWS:
+        problems.append(f"{api} 返回 {len(frame)} 行，接近单次上限，可能被截断")
+    keys = [key for key in KEYS.get(api, []) if key in frame]
+    if keys and len(keys) == len(KEYS[api]) and frame.duplicated(keys).any():
+        problems.append(f"{api} 存在重复键 {keys}")
+    column = DATE_COLUMN.get(api)
+    if column in frame and "start_date" in params:
+        dates = frame[column].astype(str)
+        outside = (dates < params["start_date"]) | (dates > params["end_date"])
+        if outside.any():
+            problems.append(f"{api} 返回 {int(outside.sum())} 行请求区间外的日期")
+    return problems
+
+
+class SnapshotLedger:
+    """files.jsonl：每个已完成文件的请求、行数、覆盖日期、SHA256 与取得时间（只追加）。"""
+
+    def __init__(self, root: Path) -> None:
+        self.path = root / "files.jsonl"
+        self.root = root
+        self.entries: dict[str, dict[str, Any]] = {}
+        # 中断时最后一行可能没写完、没有换行：下一条登记必须另起一行，否则会粘连而丢失。
+        self._needs_newline = False
+        if self.path.exists():
+            text = self.path.read_text(encoding="utf-8")
+            self._needs_newline = bool(text) and not text.endswith("\n")
+            for line in text.splitlines():
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    # 中断时写了半行：该文件视为未完成，不当作已登记。
+                    continue
+                self.entries[entry["file"]] = entry
+
+    def record(self, entry: dict[str, Any]) -> None:
+        with self.path.open("a", encoding="utf-8") as handle:
+            if self._needs_newline:
+                handle.write("\n")
+                self._needs_newline = False
+            handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        self.entries[entry["file"]] = entry
+
+    def verified(self, relative: str, params: dict[str, Any] | None = None) -> bool:
+        """已登记、参数一致且哈希相符返回 True；未登记返回 False；不符直接报错，不覆盖。"""
+        path = self.root / relative
+        entry = self.entries.get(relative)
+        if entry is None:
+            if path.exists():
+                raise ValueError(f"{relative} 存在但未登记，不会覆盖；请检查后换新目录或执行迁移")
+            return False
+        if params is not None and entry.get("params") != params:
+            raise ValueError(f"{relative} 登记的请求参数与本次计划不一致")
+        if not path.exists() or sha256_file(path) != entry["sha256"]:
+            raise ValueError(f"{relative} 缺失或哈希不符（可能被修改或写入中断）")
+        return True
+
+
 def download(
     query: Callable[..., pd.DataFrame],
     root: Path,
@@ -49,56 +180,157 @@ def download(
     end: date,
     source: str,
     log: Callable[[str], None] = print,
+    endpoint_digest: str = "unspecified",
 ) -> dict[str, Any]:
-    """下载指数月度成分及全部出现过的成分股原始数据；已存在的文件跳过（可断点续传）。"""
+    """按固定计划下载；可断点续传，但只跳过已登记且哈希相符的文件。"""
     root.mkdir(parents=True, exist_ok=True)
+    plan = make_plan(index_code, start, end, source, endpoint_digest)
+    plan_path = root / "plan.json"
+    if plan_path.exists():
+        existing = json.loads(plan_path.read_text(encoding="utf-8"))
+        if existing != plan:
+            changed = sorted(key for key in plan if existing.get(key) != plan.get(key))
+            raise ValueError(f"快照计划已改变（{changed}）；参数变化请使用新的快照目录")
+    elif any(root.iterdir()):
+        raise ValueError("目录已有内容但没有 plan.json；旧快照请先执行 snapshot --migrate")
+    else:
+        _write_json(plan_path, plan)
+    manifest = {**plan, "status": "running", "plan_sha256": sha256_file(plan_path)}
+    _write_json(root / "manifest.json", manifest)
+    ledger = SnapshotLedger(root)
     span = {"start_date": _ymd(start), "end_date": _ymd(end)}
 
-    def save(frame: pd.DataFrame, path: Path) -> None:
+    def fetch(api: str, relative: str, calls: list[dict[str, Any]]) -> pd.DataFrame:
+        if ledger.verified(relative, {"calls": calls}):
+            return pd.read_parquet(root / relative)
+        frames = []
+        for params in calls:
+            frame = query(api, **params)
+            problems = check_result(api, frame, params)
+            if problems:
+                _write_json(root / "manifest.json", {**manifest, "status": "failed"})
+                raise ValueError("；".join(problems) + f"（{relative}）")
+            frames.append(frame)
+        result = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        if result.empty and api in NONEMPTY_TOTAL:
+            _write_json(root / "manifest.json", {**manifest, "status": "failed"})
+            raise ValueError(f"{api} 合并后为空（{relative}）")
+        path = root / relative
         path.parent.mkdir(parents=True, exist_ok=True)
-        frame.to_parquet(path, index=False)
+        temporary = path.with_name(path.name + ".tmp")
+        result.to_parquet(temporary, index=False)
+        temporary.replace(path)  # 写完才发布，中断不会留下"看似完整"的文件
+        column = DATE_COLUMN.get(api)
+        dates = result[column].astype(str) if column and column in result else None
+        ledger.record(
+            {
+                "file": relative,
+                "api": api,
+                "params": {"calls": calls},
+                "rows": len(result),
+                "first_date": None if dates is None or dates.empty else dates.min(),
+                "last_date": None if dates is None or dates.empty else dates.max(),
+                "sha256": sha256_file(path),
+                "retrieved_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                "status": "complete" if len(result) else "empty",
+            }
+        )
+        return result
 
-    if not (root / "trade_cal.parquet").exists():
-        save(query("trade_cal", exchange="SSE", **span), root / "trade_cal.parquet")
-    if not (root / "stock_basic.parquet").exists():
-        fields = "ts_code,symbol,name,market,exchange,list_status,list_date,delist_date"
-        basic = [query("stock_basic", list_status=s, fields=fields) for s in "LDP"]
-        save(pd.concat(basic, ignore_index=True), root / "stock_basic.parquet")
-    weights_path = root / f"index_weight_{index_code}.parquet"
-    if not weights_path.exists():
-        months = pd.period_range(start, end, freq="M")
-        frames = [
-            query(
-                "index_weight",
-                index_code=index_code,
-                start_date=_ymd(m.start_time.date()),
-                end_date=_ymd(min(m.end_time.date(), end)),
-            )
+    fetch("trade_cal", "trade_cal.parquet", [{"exchange": "SSE", **span}])
+    fetch(
+        "stock_basic",
+        "stock_basic.parquet",
+        [{"list_status": status, "fields": STOCK_BASIC_FIELDS} for status in "LDP"],
+    )
+    months = pd.period_range(start, end, freq="M")
+    weights = fetch(
+        "index_weight",
+        f"index_weight_{index_code}.parquet",
+        [
+            {
+                "index_code": index_code,
+                "start_date": _ymd(m.start_time.date()),
+                "end_date": _ymd(min(m.end_time.date(), end)),
+            }
             for m in months
-        ]
-        save(pd.concat(frames, ignore_index=True), weights_path)
-    codes = sorted(set(pd.read_parquet(weights_path)["con_code"].astype(str)))
+        ],
+    )
+    codes = sorted(set(weights["con_code"].astype(str)))
     for number, code in enumerate(codes, 1):
         for api in PER_CODE:
-            path = root / api / f"{code}.parquet"
-            if not path.exists():
-                params = {"ts_code": code} | ({} if api == "namechange" else span)
-                save(query(api, **params), path)
+            params = {"ts_code": code} | ({} if api == "namechange" else span)
+            fetch(api, f"{api}/{code}.parquet", [params])
         if number % 50 == 0:
             log(f"{number}/{len(codes)}")
     manifest = {
+        **manifest,
+        "status": "complete",
         "source": source,
-        "start": start.isoformat(),
-        "end": end.isoformat(),
         "index_codes": [index_code],
         "codes": codes,
-        "datasets": ["trade_cal", "stock_basic", "index_weight", *PER_CODE],
+        "files": len(ledger.entries),
         "downloaded_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "units": "daily.vol=手, daily.amount=千元（读取时换算为股、元）",
     }
-    (root / "manifest.json").write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    _write_json(root / "manifest.json", manifest)
+    return manifest
+
+
+def migrate_legacy(root: Path) -> dict[str, Any]:
+    """离线迁移旧快照：扫描现有文件生成核验清单，标记 legacy。
+
+    没有原始下载计划与逐文件来源证据：请求参数记为未知，只保证"从迁移时起文件未被改动"。
+    """
+    manifest_path = root / "manifest.json"
+    if not manifest_path.exists():
+        raise ValueError("没有 manifest.json，无法识别旧快照")
+    if (root / "plan.json").exists() or (root / "files.jsonl").exists():
+        raise ValueError("该目录已有 plan.json 或 files.jsonl，不需要迁移")
+    old = json.loads(manifest_path.read_text(encoding="utf-8"))
+    established = datetime.now().astimezone().isoformat(timespec="seconds")
+    plan = {
+        "format_version": FORMAT_VERSION,
+        "legacy": True,
+        "source_label": old.get("source"),
+        "endpoint_digest": "unknown_legacy",
+        "index_code": (old.get("index_codes") or [None])[0],
+        "start": old.get("start"),
+        "end": old.get("end"),
+        "datasets": old.get("datasets"),
+        "stock_basic_fields": STOCK_BASIC_FIELDS,
+        "integrity_established_at": established,
+    }
+    _write_json(root / "plan.json", plan)
+    ledger = SnapshotLedger(root)
+    for path in sorted(root.rglob("*.parquet")):
+        relative = str(path.relative_to(root))
+        api = path.parent.name if path.parent != root else path.stem.split("_index")[0]
+        api = "index_weight" if path.name.startswith("index_weight_") else api
+        frame = pd.read_parquet(path)
+        column = DATE_COLUMN.get(api)
+        dates = frame[column].astype(str) if column and column in frame else None
+        ledger.record(
+            {
+                "file": relative,
+                "api": api,
+                "params": "unknown_legacy",
+                "rows": len(frame),
+                "first_date": None if dates is None or dates.empty else dates.min(),
+                "last_date": None if dates is None or dates.empty else dates.max(),
+                "sha256": sha256_file(path),
+                "retrieved_at": "unknown_legacy",
+                "status": "legacy",
+            }
+        )
+    manifest = {
+        **old,
+        **{key: plan[key] for key in ["format_version", "legacy", "integrity_established_at"]},
+        "status": "complete",
+        "plan_sha256": sha256_file(root / "plan.json"),
+        "files": len(ledger.entries),
+    }
+    _write_json(manifest_path, manifest)
     return manifest
 
 
@@ -129,6 +361,12 @@ class TushareSnapshotProvider:
             raise ValueError(f"Tushare 快照缺少 manifest.json：{root}；先运行 snapshot 命令")
         self.root = root
         self.manifest = json.loads(manifest.read_text(encoding="utf-8"))
+        if self.manifest.get("format_version") != FORMAT_VERSION:
+            raise ValueError("旧格式快照没有逐文件核验清单；请先执行 snapshot --migrate")
+        if self.manifest.get("status") != "complete":
+            raise ValueError(f"快照状态为 {self.manifest.get('status')}，不是 complete")
+        self.ledger = SnapshotLedger(root)
+        self._checked: set[str] = set()
         self.start = date.fromisoformat(self.manifest["start"])
         self.end = date.fromisoformat(self.manifest["end"])
         self.source = (
@@ -137,19 +375,24 @@ class TushareSnapshotProvider:
             "daily;adj_factor;suspend_d;namechange;trade_cal;stock_basic;index_weight"
         )
 
+    def _file(self, relative: str) -> pd.DataFrame:
+        """读取前核对登记的哈希；未登记、缺失或被改动都停止。"""
+        if relative not in self._checked:
+            if not self.ledger.verified(relative):
+                raise ValueError(f"快照中没有已登记的 {relative}")
+            self._checked.add(relative)
+        return pd.read_parquet(self.root / relative)
+
     def _read(self, api: str, code: str) -> pd.DataFrame:
-        path = self.root / api / f"{code}.parquet"
-        if not path.exists():
-            raise ValueError(f"快照中没有 {code} 的 {api}")
-        return pd.read_parquet(path)
+        return self._file(f"{api}/{code}.parquet")
 
     def fetch_calendar(self) -> pd.DataFrame:
-        cal = pd.read_parquet(self.root / "trade_cal.parquet")
+        cal = self._file("trade_cal.parquet")
         days = _parse(cal.loc[cal["is_open"].astype(int) == 1, "cal_date"])
         return pd.DataFrame({"trade_date": days.sort_values().reset_index(drop=True)})
 
     def fetch_instruments(self) -> pd.DataFrame:
-        basic = pd.read_parquet(self.root / "stock_basic.parquet")
+        basic = self._file("stock_basic.parquet")
         return pd.DataFrame(
             {
                 "symbol": basic["ts_code"],
@@ -240,10 +483,7 @@ class TushareSnapshotProvider:
         """as_of 当日或之前最近一次已发布的成分（不使用之后的月末权重）。"""
         if index not in INDEXES:
             raise ValueError(f"Tushare 快照目前只包含 {sorted(INDEXES)}")
-        path = self.root / f"index_weight_{INDEXES[index]}.parquet"
-        if not path.exists():
-            raise ValueError(f"快照中没有 {index} 的历史成分")
-        weights = pd.read_parquet(path)
+        weights = self._file(f"index_weight_{INDEXES[index]}.parquet")
         weights = weights.assign(published=_parse(weights["trade_date"]))
         known = weights[weights["published"] <= pd.Timestamp(as_of)]
         if known.empty:

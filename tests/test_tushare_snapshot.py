@@ -179,16 +179,30 @@ def test_chinext_covers_whole_30_segment():
     assert board("002594.SZ") == "main"
 
 
-def drop_daily(root, code, day):
-    path = root / "daily" / f"{code}.parquet"
-    frame = pd.read_parquet(path)
-    frame[frame.trade_date != day].to_parquet(path, index=False)
+def build(tmp_path, edit):
+    """来源本身返回经 edit 修改的数据（不是下载后再改文件——那属于篡改，会被拒绝）。"""
+    base = fake_query([])
+
+    def query(api, **params):
+        return edit(api, params, base(api, **params))
+
+    root = tmp_path / "edited"
+    download(query, root, "399300.SZ", date(2024, 1, 2), date(2024, 1, 9), "测试", log=print)
+    return root
+
+
+def without_daily(code, day):
+    def edit(api, params, frame):
+        if api == "daily" and params.get("ts_code") == code:
+            return frame[frame.trade_date != day]
+        return frame
+
+    return edit
 
 
 def test_missing_trading_day_is_unknown_not_suspended(snapshot):
     """审查反例：删掉正常交易日 01-03 的日线，不能凭缺行生成停牌。"""
-    root = snapshot[0]
-    drop_daily(root, "600518.SH", "20240103")
+    root = build(snapshot[0].parent, without_daily("600518.SH", "20240103"))
     bars = TushareSnapshotProvider(root).fetch_daily_bars(
         "600518.SH", date(2024, 1, 2), date(2024, 1, 9)
     )
@@ -208,11 +222,12 @@ def test_missing_trading_day_is_unknown_not_suspended(snapshot):
 
 
 def test_full_day_suspension_with_trades_is_a_conflict(snapshot):
-    root = snapshot[0]
-    path = root / "suspend_d" / "600518.SH.parquet"
-    frame = pd.read_parquet(path)
-    frame.loc[len(frame)] = ["600518.SH", "20240105", None, "S"]
-    frame.to_parquet(path, index=False)
+    def edit(api, params, frame):
+        if api == "suspend_d" and params.get("ts_code") == "600518.SH":
+            frame.loc[len(frame)] = ["600518.SH", "20240105", None, "S"]
+        return frame
+
+    root = build(snapshot[0].parent, edit)
     bars = TushareSnapshotProvider(root).fetch_daily_bars(
         "600518.SH", date(2024, 1, 2), date(2024, 1, 9)
     )
@@ -221,10 +236,12 @@ def test_full_day_suspension_with_trades_is_a_conflict(snapshot):
 
 
 def test_delisting_tail_needs_evidence(snapshot):
-    root = snapshot[0]
-    path = root / "suspend_d" / "600001.SH.parquet"
-    frame = pd.read_parquet(path)
-    frame[frame.trade_date != "20240108"].to_parquet(path, index=False)
+    def edit(api, params, frame):
+        if api == "suspend_d" and params.get("ts_code") == "600001.SH":
+            return frame[frame.trade_date != "20240108"]
+        return frame
+
+    root = build(snapshot[0].parent, edit)
     bars = TushareSnapshotProvider(root).fetch_daily_bars(
         "600001.SH", date(2024, 1, 2), date(2024, 1, 9)
     )
@@ -233,8 +250,7 @@ def test_delisting_tail_needs_evidence(snapshot):
 
 
 def test_export_refuses_gaps_unless_placeholders_are_explicit(snapshot, monkeypatch, tmp_path):
-    root = snapshot[0]
-    drop_daily(root, "600518.SH", "20240103")
+    root = build(snapshot[0].parent, without_daily("600518.SH", "20240103"))
     monkeypatch.setenv("TUSHARE_SNAPSHOT_DIR", str(root))
     monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
     export = ["export", "--provider", "tushare", "--codes", "600518.SH"]
@@ -251,3 +267,107 @@ def test_export_refuses_gaps_unless_placeholders_are_explicit(snapshot, monkeypa
     assert any(
         item["kind"] == "unverified_gap" and "2024-01-03" in item["detail"] for item in quality
     )
+
+
+def test_changed_plan_cannot_reuse_old_files(snapshot):
+    """审查反例：把结束日改到 01-31 后，旧文件被沿用而 manifest 却声明新范围。"""
+    root, calls = snapshot
+    before = len(calls)
+    with pytest.raises(ValueError, match="计划已改变"):
+        download(fake_query(calls), root, "399300.SZ", date(2024, 1, 2), date(2024, 1, 31), "测试")
+    assert len(calls) == before
+    assert json.loads((root / "manifest.json").read_text())["end"] == "2024-01-09"
+
+
+def test_tampered_or_unregistered_files_stop_reads_and_resume(snapshot):
+    root, calls = snapshot
+    path = root / "daily" / "600518.SH.parquet"
+    frame = pd.read_parquet(path)
+    frame.loc[0, "close"] = 999.0
+    frame.to_parquet(path, index=False)
+    with pytest.raises(ValueError, match="哈希不符"):
+        TushareSnapshotProvider(root).fetch_daily_bars(
+            "600518.SH", date(2024, 1, 2), date(2024, 1, 9)
+        )
+    with pytest.raises(ValueError, match="哈希不符"):
+        download(fake_query(calls), root, "399300.SZ", date(2024, 1, 2), date(2024, 1, 9), "测试")
+    assert pd.read_parquet(path).loc[0, "close"] == 999.0  # 坏文件不被默默覆盖
+
+
+def test_interrupted_write_is_redownloaded_not_trusted(snapshot):
+    root, calls = snapshot
+    ledger = root / "files.jsonl"
+    lines = ledger.read_text().splitlines()
+    target = "namechange/600518.SH.parquet"
+    kept = [line for line in lines if json.loads(line)["file"] != target]
+    # 模拟中断：最终文件未发布，只留下临时文件和半行登记。
+    ledger.write_text("\n".join(kept) + '\n{"file": "namechange/600518')
+    (root / target).replace(root / (target + ".tmp"))
+    before = len(calls)
+    download(fake_query(calls), root, "399300.SZ", date(2024, 1, 2), date(2024, 1, 9), "测试")
+    assert calls[before:] == ["namechange"]  # 只补缺项
+    TushareSnapshotProvider(root).fetch_daily_bars("600518.SH", date(2024, 1, 2), date(2024, 1, 9))
+
+
+@pytest.mark.parametrize(
+    "api, frame, params, message",
+    [
+        ("index_weight", pd.DataFrame(), {}, "不允许为空"),
+        (
+            "daily",
+            pd.DataFrame({"trade_date": ["20240102", "20240102"]}),
+            {"start_date": "20240102", "end_date": "20240109"},
+            "重复键",
+        ),
+        (
+            "daily",
+            pd.DataFrame({"trade_date": ["20240102", "20240301"]}),
+            {"start_date": "20240102", "end_date": "20240109"},
+            "区间外",
+        ),
+        ("daily", pd.DataFrame({"trade_date": ["20240102"] * 5000}), {}, "截断"),
+    ],
+)
+def test_result_diagnostics(api, frame, params, message):
+    from quant_agent.data.tushare_snapshot import check_result
+
+    assert any(message in problem for problem in check_result(api, frame, params))
+    assert check_result("suspend_d", pd.DataFrame(), {}) == []  # 没有停牌是正常的空表
+
+
+def test_bad_source_result_marks_snapshot_failed(tmp_path):
+    def edit(api, params, frame):
+        if api == "daily" and params.get("ts_code") == "600518.SH":
+            return pd.concat([frame, frame.head(1)])
+        return frame
+
+    with pytest.raises(ValueError, match="重复键"):
+        build(tmp_path, edit)
+    manifest = json.loads((tmp_path / "edited" / "manifest.json").read_text())
+    assert manifest["status"] == "failed"
+    with pytest.raises(ValueError, match="不是 complete"):
+        TushareSnapshotProvider(tmp_path / "edited")
+
+
+def test_legacy_snapshot_requires_explicit_offline_migration(snapshot, monkeypatch, tmp_path):
+    from quant_agent.data.tushare_snapshot import migrate_legacy
+
+    root = snapshot[0]
+    for name in ["plan.json", "files.jsonl"]:
+        (root / name).unlink()
+    manifest = json.loads((root / "manifest.json").read_text())
+    for key in ["format_version", "status", "plan_sha256", "files"]:
+        manifest.pop(key, None)
+    (root / "manifest.json").write_text(json.dumps(manifest))  # 旧格式
+    with pytest.raises(ValueError, match="migrate"):
+        TushareSnapshotProvider(root)
+    monkeypatch.setenv("TUSHARE_SNAPSHOT_DIR", str(root))
+    assert main(["snapshot", "--migrate"]) == 0
+    plan = json.loads((root / "plan.json").read_text())
+    assert plan["legacy"] and plan["integrity_established_at"]
+    entries = [json.loads(line) for line in (root / "files.jsonl").read_text().splitlines()]
+    assert {entry["status"] for entry in entries} == {"legacy"}
+    assert {entry["params"] for entry in entries} == {"unknown_legacy"}
+    TushareSnapshotProvider(root).fetch_daily_bars("600518.SH", date(2024, 1, 2), date(2024, 1, 9))
+    with pytest.raises(ValueError, match="不需要迁移"):
+        migrate_legacy(root)
