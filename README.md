@@ -2,63 +2,32 @@
 
 [![tests](https://github.com/bar-art/ashare-data-pipeline/actions/workflows/tests.yml/badge.svg)](https://github.com/bar-art/ashare-data-pipeline/actions/workflows/tests.yml)
 
-**回测结果只能和数据一样可信。** 这个项目整理、核对和导出 A 股历史日线，专门处理免费数据源最容易出错、又最影响回测结论的几件事：
+把 A 股历史日线整理成可以放心回测的数据：下载、检查、和第二个数据源逐日核对，再导出成 CSV。
 
-- **幸存者偏差：** 用历史指数成分（含后来调出和退市的股票）构建股票池，而不是今天的名单；
-- **停牌：** 只有来源记录确认的停牌才标为停牌，没有证据的缺失单独标出，不做推断；
-- **涨跌停：** 按各板块的历史规则计算涨跌停价，下游回测据此判断能否成交；
-- **复权：** 停牌期间除权时，复权因子的变化落在复牌日，避免后复权价凭空跳涨。
+## 为什么需要它
 
-导出的数据供 [quant-research-lab](https://github.com/bar-art/quant-research-lab)（回测）和 [alpha-evidence-lab](https://github.com/bar-art/alpha-evidence-lab)（搜索方法比较）使用。仓库原名 a-share-quant-agent，Python 包名 `quant_agent` 和命令 `quant-agent` 保持不变。
+直接拿免费行情做回测，常见四个坑，每个都会让结果看起来比实际好：
+
+1. **只用今天的成分股。** 用今天的沪深300名单回测过去十年，等于提前排除了后来被调出、退市的股票，收益会被高估（幸存者偏差）。本项目按每个月当时的成分构建股票池。
+2. **停牌当成正常交易。** 停牌的股票买不进也卖不出。本项目只把有停牌记录的日子标为停牌；既没有成交、也没有停牌记录的日子单独标出来，不去猜。
+3. **忽略涨跌停。** 涨停时很难买到，跌停时很难卖出。本项目按各板块当年的规则算出每天的涨跌停价，回测程序据此判断能否成交。
+4. **除权日价格断层。** 分红送股后股价会"跳水"，但持有人并没有亏钱。本项目导出复权价格消除这种断层，并修正了停牌期间除权导致的价格错误跳涨。
 
 ## 核对结果
 
-以 2015–2026 年沪深300的完整历史成分为例（668 只股票，含后来调出和退市的），数据来自 Tushare 本地快照：
+用 2015–2026 年所有当过沪深300成分的 668 只股票（含后来调出和退市的）检验：
 
-| 检查 | 结果 |
-|---|---|
-| 与 BaoStock 逐日对照（7 只股票，2020–2024，约 7,300 行） | 开高低收、昨收、成交量、停牌、ST 全部一致。唯一差异是 BaoStock 在 000001.SZ 2020-12-31 的复权因子在没有公司行动的情况下下跳 17%，判断为 BaoStock 的错误 |
-| 规则计算的涨跌停价 vs 交易所公布值（170 万个交易行） | 99.97% 一致。不一致的 445 行中：411 行来自一只未完成股改的 S 股（5% 限制，规则尚未覆盖）；22 行是沪市 2015–2017 年跌停价恰好落在半分位时的舍入方向；7 行 ST 状态与限幅不符，原因未明；5 行是 Tushare 给科创板的占位值 |
-| 停牌证据 | 交易区间内缺失的 43,903 行日线中，97.1% 有当天的全天停牌记录。其余 1,545 行（29 只股票，主要是几段 6–15 个月的长期停牌）没有逐日记录，作为缺口单独列出 |
-| 与 Yahoo Finance 对照（7 只股票，2020–2024） | Yahoo 的最高、最低价没有一次越过规则计算的涨跌停价。Yahoo 自身有 149 个错误收盘价，并把一个正常交易日标成无成交，经新浪数据确认是 Yahoo 的错误 |
-| 核对中修复的问题 | 创业板 302 开头的代码曾被按主板 10% 计算涨跌停；停牌期间除权曾导致后复权价凭空上涨（最多 +200%） |
+- **和交易所公布的涨跌停价对比：** 约 170 万个交易日中 99.97% 一致；不一致的 445 行原因都已查明或列出，其中 411 行来自同一只特殊股票。
+- **停牌：** 没有行情的 43,903 个交易日里，97.1% 能找到当天的停牌记录；其余 1,545 天作为缺口单独列出。
+- **和 BaoStock 对比**（7 只股票，2020–2024）：价格、成交量、停牌、ST 全部一致，还发现了 BaoStock 自己的一处复权错误。
+- **和 Yahoo Finance 对比：** 发现 Yahoo 有 149 个错误收盘价。
+- **核对中修好的问题：** 一类创业板代码被错算成 10% 涨跌停；停牌期间除权导致复权价凭空上涨，最多 +200%。
 
-导出结果：1,737,796 行日线，143 次月度成分快照，每次 300 只。
-
-## 数据处理规则
-
-**历史股票池。** 每月取一次指数成分。某一天使用不晚于当天的最近一次快照，导出时逐日写入 `universe_member`。调出后的股票仍保留行情，用于估值和卖出，但不再作为新的买入对象。月度快照意味着调入调出最多滞后一个月。
-
-**停牌。** 每个交易日有一个状态 `bar_status`：
-
-| 状态 | 含义 | `is_suspended` |
-|---|---|---|
-| `traded` | 有成交（包括盘中停牌后恢复交易的日子） | 否 |
-| `suspended` | 无成交，且当天有全天停牌记录 | 是 |
-| `missing` | 无成交，也没有停牌记录 | 未知 |
-| `conflict` | 有全天停牌记录，却有成交 | 未知 |
-
-默认导出遇到 `missing` 或 `conflict` 会停止，并列出股票和日期。加 `--allow-gap-placeholders` 后，这些日子导出为不可成交的估值行，并在 `export_report.json` 中逐日记录。
-
-**涨跌停价。** 由交易所昨收按板块规则计算，四舍五入到分：
-
-| 板块 | 规则 |
-|---|---|
-| 主板 | 10%；ST 股 5%，2026-07-06 起改为 10% |
-| 创业板 | 2020-08-24 起 20%（含 ST）；此前 10%，ST 5% |
-| 科创板 | 20% |
-| 北交所 | 2021-11-15 起 30% |
-| 新股 | 科创板、2020-08-24 起上市的创业板、2023-04-10 起上市的主板，前 5 个交易日不设限；北交所上市首日不设限 |
-
-规则覆盖不到的情况（例如更早的新股上市首日按发行价计算），涨跌停价留空，下游回测据此拒绝成交。如果某天的实际最高价或最低价越过了计算出的涨跌停价，说明规则不适用，当天的涨跌停价也改为未知。规则来源见 [docs/data_coverage.md](docs/data_coverage.md)。
-
-**复权。** 默认导出后复权价格（`--price-mode hfq`），涨跌停价乘以同一个因子，除权日不会出现虚假亏损；`raw` 输出交易所原始价格。使用 Tushare 快照时，停牌期间沿用停牌前最后一个交易日的复权因子。
-
-**ST。** BaoStock 直接提供历史 ST 标记；Tushare 快照由股票名称的历史变化推断，某天没有名称记录时 ST 状态为未知。
-
-**可得时间。** 每行日线的 `available_at` 记为当天 15:00（北京时间），表示收盘后才可用于决策。
+最终导出 1,737,796 行日线。完整明细见 [docs/data_rules.md](docs/data_rules.md)。
 
 ## 快速开始
+
+需要 Python 3.11。
 
 ```bash
 git clone https://github.com/bar-art/ashare-data-pipeline.git
@@ -69,92 +38,43 @@ python -m pip install -r requirements.lock
 python -m pip install --no-deps -e .
 cp .env.example .env
 
-# 离线的人工样本，用来确认安装成功
+# 用离线生成的样本数据确认安装成功
 quant-agent fetch --provider synthetic --start 2024-01-02 --end 2024-01-05
 ```
 
-## 数据来源与命令
+## 导出真实数据
 
-| 来源 | 用途 | 需要 |
-|---|---|---|
-| AKShare | 快速取单只股票日线（`fetch`），默认来源 | 能访问国内数据源 |
-| BaoStock | 昨收、停牌、ST、复权因子、历史成分 | 免费，无需账号；使用 10030 端口，部分网络会拦截 |
-| Tushare | 本地快照：月度历史成分、日线、复权、涨跌停、停牌、名称变更 | `.env` 中的 `TUSHARE_TOKEN` |
-| Yahoo Finance | 只用于交叉核对 | 免费 |
-
-**BaoStock：直接导出**
+最简单的方式是用 BaoStock（免费，不需要账号）：
 
 ```bash
 quant-agent export --provider baostock --codes 600000.SH 000001.SZ 300750.SZ \
-  --start 2020-01-02 --end 2024-12-31 --target quant-research-lab --output output/qrl_input
+  --start 2020-01-02 --end 2024-12-31 --target quant-research-lab --output output/my_data
 ```
 
-**用历史成分构建股票池**
+输出目录里有：
 
-```bash
-quant-agent universe --provider baostock --index hs300 --monthly \
-  --start 2015-01-05 --end 2026-11-20 --output output/hs300-monthly
-quant-agent export --provider baostock --universe-file output/hs300-monthly/hs300_historical_members.csv \
-  --start 2015-01-05 --end 2026-11-20 --target quant-research-lab --output output/qrl_hs300
-```
+- `bars.csv`：每只股票每天一行，包含价格、是否停牌、涨跌停价、是否 ST，以及收盘后才可用的时间戳；
+- `manifest.json`：数据来源和覆盖范围；
+- `export_report.json`：本次导出的检查报告，列出停牌、缺口和发现的问题。
 
-支持 `hs300`、`zz500`、`sz50`。导出快照里出现过的全部股票，包括之后调出和退市的。任何股票取不到行情时默认停止；加 `--skip-unavailable` 会跳过并在报告中记录。
+`--target alpha-evidence-lab` 则改为每只股票一个 CSV。两种格式分别给 [quant-research-lab](https://github.com/bar-art/quant-research-lab) 和 [alpha-evidence-lab](https://github.com/bar-art/alpha-evidence-lab) 使用。
 
-**Tushare：先建本地快照，之后离线使用**
+想用历史成分做股票池、改用 Tushare 本地快照，或者和 Yahoo 交叉核对，见 [docs/data_rules.md](docs/data_rules.md)。那里也写了停牌状态、各板块涨跌停规则、复权和 ST 的具体处理方式。
 
-```bash
-quant-agent snapshot --index hs300 --start 2014-01-01 --end 2026-11-24      # 联网一次，可断点续传
-quant-agent universe --provider tushare --index hs300 --monthly \
-  --start 2015-01-01 --end 2026-11-24 --output output/hs300-tushare
-quant-agent export --provider tushare --start 2015-01-05 --end 2026-11-24 \
-  --universe-file output/hs300-tushare/hs300_historical_members.csv \
-  --allow-gap-placeholders --target quant-research-lab --output output/qrl_hs300_tushare
-```
+## 还没做到的
 
-token 会过期，所以先把原始返回完整保存下来。快照可以校验：
-
-- 首次下载前写入 `plan.json`，记录接口、指数、日期范围和来源类型，不含 token；参数改变时必须换新目录；
-- `files.jsonl` 记录每个文件的请求参数、行数、覆盖日期和 SHA256；
-- 文件写完才发布，续传只跳过登记过且哈希相符的文件，读取时逐个核对哈希；
-- 返回结果会检查空表、疑似截断、重复键和区间外日期；
-- 旧格式快照用 `quant-agent snapshot --migrate` 离线建立校验清单。
-
-快照目录默认是 `data/tushare_raw`（可用 `TUSHARE_SNAPSHOT_DIR` 修改），不提交到仓库。
-
-**交叉核对**
-
-```bash
-quant-agent crosscheck --provider baostock --codes 600000.SH 000001.SZ 600518.SH \
-  --start 2020-01-02 --end 2024-12-31 --output output/crosscheck_yahoo
-```
-
-默认用 Yahoo Finance 核对收盘价、停牌、公司行动日期和涨跌停价；`--check-source tushare` 改用 Tushare。两个来源只做比较，不互相覆盖。
-
-## 导出格式
-
-| `--target` | 文件 | 说明 |
-|---|---|---|
-| `quant-research-lab` | `bars.csv` + `manifest.json` | 多股票长表，含 `universe_member`（如果提供了股票池） |
-| `alpha-evidence-lab` | 每只股票一个 CSV | 保留停牌行和涨跌停字段 |
-
-每次导出都会写 `export_report.json`：行数、停牌和 ST 行数、各条涨跌停规则的使用次数、缺口占位、质量问题和数据版本。`manifest.json` 中 `historical_universe_complete` 始终为 `false`，因为月度快照不等于每日精确成分。
-
-## 局限与待补充
-
-- 未完成股权分置改革的 S 股（5% 涨跌停）、更早新股上市首日的发行价规则尚未覆盖；
-- 沪市少数跌停价落在半分位时的舍入方向，与交易所公布值存在 1 分钱差异；
-- 北交所不在 BaoStock 的覆盖范围内；
-- 没有公告日口径的财务数据；
-- 月度成分快照不是当时首次发布的原始版本，调入调出最多滞后一个月；
-- 退市整理期、重新上市等特殊情形没有单独建模。
+- 少数特殊情况的涨跌停规则还没覆盖：未完成股改的 S 股、较早新股上市首日；
+- 沪市少数跌停价和交易所公布值差 1 分钱（舍入方向问题）；
+- 成分股是月度快照，调入调出最多晚一个月；
+- BaoStock 不含北交所；
+- 没有财务数据；退市整理期、重新上市等情形没有单独处理。
 
 ## 开发
 
 ```bash
-ruff check . && ruff format --check . && mypy quant_agent && pytest      # 离线，覆盖率门槛 80%
-sh scripts/contract_check.sh      # 可选：三个项目并列时，用两个下游项目的真实导入器读取导出结果
+ruff check . && ruff format --check . && mypy quant_agent && pytest      # 全部离线运行
 ```
 
-设计说明见 [docs/design.md](docs/design.md)，字段覆盖情况见 [docs/data_coverage.md](docs/data_coverage.md)。
+设计说明见 [docs/design.md](docs/design.md)，字段覆盖见 [docs/data_coverage.md](docs/data_coverage.md)。仓库原名 a-share-quant-agent，所以 Python 包名仍是 `quant_agent`，命令仍是 `quant-agent`。
 
 仅供研究，不构成投资建议。
