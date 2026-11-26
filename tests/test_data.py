@@ -211,7 +211,7 @@ def test_cli_all_commands(tmp_path, monkeypatch, capsys):
 
 
 def test_settings_secret_and_bounds():
-    settings = Settings(llm_api_key="not-a-real-key", _env_file=None)
+    settings = Settings(tushare_token="not-a-real-key", _env_file=None)
     assert "not-a-real-key" not in repr(settings)
     with pytest.raises(ValueError):
         Settings(request_attempts=0, _env_file=None)

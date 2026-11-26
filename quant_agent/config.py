@@ -17,5 +17,3 @@ class Settings(BaseSettings):
     tushare_http_url: str = ""
     # snapshot 命令写入、--provider tushare 读取的本地快照目录。
     tushare_snapshot_dir: Path = Path("data/tushare_raw")
-    llm_api_key: SecretStr = SecretStr("")
-    llm_model: str = ""
