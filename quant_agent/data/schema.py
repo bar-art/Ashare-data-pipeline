@@ -6,7 +6,18 @@ from datetime import date
 import pandas as pd
 
 PRICES = ["open", "high", "low", "close"]
-OPTIONAL = ["pre_close", "adj_factor", "up_limit", "down_limit", "is_st", "is_suspended"]
+OPTIONAL = [
+    "pre_close",
+    "adj_factor",
+    "up_limit",
+    "down_limit",
+    "is_st",
+    "is_suspended",
+    "bar_status",
+]
+# 行状态：traded（有成交）、suspended（来源确认的全天停牌）、missing（无行情也无停牌证据）、
+# conflict（来源相互矛盾）。missing/conflict 的 is_suspended 为未知。
+BAR_STATUSES = {"traded", "suspended", "missing", "conflict"}
 COLUMNS = [
     "ts_code",
     "trade_date",
@@ -19,6 +30,7 @@ COLUMNS = [
     "is_suspended",
     "up_limit",
     "down_limit",
+    "bar_status",
 ]
 
 
@@ -62,6 +74,12 @@ def normalize(frame: pd.DataFrame, code: str) -> pd.DataFrame:
         result[column] = pd.to_numeric(result[column], errors="raise").astype("Float64")
     for column in ["is_st", "is_suspended"]:
         result[column] = result[column].astype("boolean")
+    result["bar_status"] = result["bar_status"].astype("string")
+    unknown_status = ~result["bar_status"].isna() & ~result["bar_status"].isin(BAR_STATUSES)
+    if unknown_status.any():
+        raise ValueError(
+            f"未知的行状态：{sorted(result.loc[unknown_status, 'bar_status'].unique())}"
+        )
     if result.duplicated(["ts_code", "trade_date"]).any():
         raise ValueError("同一证券同一日期存在重复行情")
     return result[COLUMNS].sort_values("trade_date").reset_index(drop=True)

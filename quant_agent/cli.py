@@ -124,9 +124,11 @@ def run_export(args: argparse.Namespace, service: DataService, cache: LocalCache
             f"{days[0]} 至 {days[-1]}，两次快照之间视为不变）"
         )
     summary: dict[str, Any] = (
-        to_quant_research_lab(frame, source, args.output, args.price_mode, universe)
+        to_quant_research_lab(
+            frame, source, args.output, args.price_mode, universe, args.allow_gap_placeholders
+        )
         if args.target == "quant-research-lab"
-        else to_alpha_evidence_lab(frame, args.output, args.price_mode)
+        else to_alpha_evidence_lab(frame, args.output, args.price_mode, args.allow_gap_placeholders)
     )
     summary.update(
         provider=service.provider.name,
@@ -232,6 +234,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--universe-file", type=Path, help="export：universe 命令输出的成分快照")
     parser.add_argument(
         "--skip-unavailable", action="store_true", help="export：跳过取不到行情的证券并记录"
+    )
+    parser.add_argument(
+        "--allow-gap-placeholders",
+        action="store_true",
+        help="export：无行情也无停牌证据的日子导出为不可成交的估值占位，并逐日记录",
     )
     parser.add_argument("--code", default="600000.SH")
     parser.add_argument("--codes", nargs="+", help="export 时的多只证券代码")

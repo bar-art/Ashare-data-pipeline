@@ -9,7 +9,10 @@ token 有有效期；落盘后结果可复现，不依赖账号是否仍可用�
   <接口>/<证券代码>.parquet           daily、adj_factor、stk_limit、suspend_d、namechange
 
 与 BaoStock 的口径差异（已在 bars() 中统一）：
-  - daily 不含全天停牌日：按交易日历补行，价格取停牌前收盘，成交量 0，is_suspended=True；
+  - daily 不含全天停牌日。按交易日历补行后，逐日用 suspend_d 判断：当天有全天停牌记录才是
+    suspended（价格取停牌前收盘、成交量 0）；既无行情也无停牌记录的是 missing，is_suspended
+    保持未知，严格导出会拒绝。盘中停牌（有 suspend_timing）当天有成交，按 traded 处理；
+    有全天停牌记录却有成交的是 conflict。
   - vol 单位为手、amount 为千元：换算为股和元；
   - ST 由 namechange 的名称区间推断；某日没有任何名称记录时为未知，不默认为否；
   - 停牌行沿用停牌前最后成交日的复权因子（停牌期间除权的因子变化落在复牌日）。
@@ -181,14 +184,20 @@ class TushareSnapshotProvider:
         frame = pd.DataFrame({"trade_date": days.to_numpy()}).merge(
             daily, on="trade_date", how="left", validate="one_to_one"
         )
-        frame["is_suspended"] = frame["close"].isna()
+        frame["bar_status"] = self._bar_status(code, frame)
+        not_traded = frame["bar_status"] != "traded"
+        frame["is_suspended"] = (
+            frame["bar_status"].map({"traded": False, "suspended": True}).astype("boolean")
+        )
         carried = frame["close"].ffill()
         for column in ["open", "high", "low", "close"]:
             frame[column] = frame[column].fillna(carried)
         # 停牌行昨收即上一交易日（沿用）的收盘价。
         frame["pre_close"] = frame["pre_close"].fillna(carried.shift(1))
-        frame["volume"] = (frame["vol"] * 100).fillna(0.0)
-        frame["amount"] = (frame["amount"] * 1000).fillna(0.0)
+        # 确认停牌无成交；缺口的成交量未知，不填 0。
+        suspended = frame["bar_status"] == "suspended"
+        frame["volume"] = (frame["vol"] * 100).mask(suspended, 0.0)
+        frame["amount"] = (frame["amount"] * 1000).mask(suspended, 0.0)
 
         factors = self._read("adj_factor", code)
         factors = factors.assign(trade_date=_parse(factors["trade_date"]))[
@@ -198,12 +207,34 @@ class TushareSnapshotProvider:
         # 停牌行价格是停牌前的原始收盘，必须配停牌前最后成交日的因子：停牌期间除权时，
         # 来源当天已发布新因子，直接相乘会凭空跳涨；因子变化应落在复牌日（原始价已除权）。
         # 长期停牌期间来源也可能不发布因子，同样沿用。
-        traded = frame["adj_factor"].where(~frame["is_suspended"]).ffill()
-        frame["adj_factor"] = frame["adj_factor"].where(~frame["is_suspended"], traded)
+        traded = frame["adj_factor"].where(~not_traded).ffill()
+        frame["adj_factor"] = frame["adj_factor"].where(~not_traded, traded)
         frame["is_st"] = st_flags(self._read("namechange", code), frame["trade_date"]).to_numpy()
         frame = frame[frame["trade_date"] >= pd.Timestamp(start)]
         keep = ["trade_date", "open", "high", "low", "close", "pre_close", "volume", "amount"]
-        return normalize(frame[[*keep, "adj_factor", "is_st", "is_suspended"]], code)
+        extra = ["adj_factor", "is_st", "is_suspended", "bar_status"]
+        return normalize(frame[[*keep, *extra]], code)
+
+    def _bar_status(self, code: str, frame: pd.DataFrame) -> pd.Series:
+        """逐日状态：有成交为 traded；无成交时只有当天的全天停牌记录才算 suspended。"""
+        events = self._read("suspend_d", code)
+        full_day: set[pd.Timestamp] = set()
+        if {"trade_date", "suspend_type"} <= set(events.columns) and not events.empty:
+            timing = (
+                events["suspend_timing"].astype("string").str.strip()
+                if "suspend_timing" in events
+                else pd.Series(pd.NA, index=events.index, dtype="string")
+            )
+            whole = timing.isna() | timing.isin(["", "None", "nan"])
+            stopped = (events["suspend_type"] == "S") & whole
+            full_day = set(_parse(events.loc[stopped, "trade_date"]).dropna())
+        traded = frame["close"].notna()
+        confirmed = frame["trade_date"].isin(full_day)
+        status = pd.Series("missing", index=frame.index, dtype="string")
+        status[traded] = "traded"
+        status[~traded & confirmed] = "suspended"
+        status[traded & confirmed] = "conflict"
+        return status
 
     def fetch_index_members(self, index: str, as_of: date) -> pd.DataFrame:
         """as_of 当日或之前最近一次已发布的成分（不使用之后的月末权重）。"""

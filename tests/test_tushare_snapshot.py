@@ -71,6 +71,20 @@ def fake_query(calls):
                     "end_date": ["20240104", None],
                 }
             )
+        if api == "suspend_d":
+            # 600518 在 01-04 全天停牌、01-08 盘中停牌（当天有成交）；600001 自 01-04 停牌至退市。
+            rows = {
+                "600518.SH": [("20240104", None), ("20240108", "09:30-10:30")],
+                "600001.SH": [("20240104", None), ("20240105", None), ("20240108", None)],
+            }[code]
+            return pd.DataFrame(
+                {
+                    "ts_code": code,
+                    "trade_date": [day for day, _ in rows],
+                    "suspend_timing": [timing for _, timing in rows],
+                    "suspend_type": "S",
+                }
+            )
         return pd.DataFrame({"ts_code": [code]})
 
     return query
@@ -163,3 +177,77 @@ def test_chinext_covers_whole_30_segment():
 
     assert board("302132.SZ") == "chinext" and board("301001.SZ") == "chinext"
     assert board("002594.SZ") == "main"
+
+
+def drop_daily(root, code, day):
+    path = root / "daily" / f"{code}.parquet"
+    frame = pd.read_parquet(path)
+    frame[frame.trade_date != day].to_parquet(path, index=False)
+
+
+def test_missing_trading_day_is_unknown_not_suspended(snapshot):
+    """审查反例：删掉正常交易日 01-03 的日线，不能凭缺行生成停牌。"""
+    root = snapshot[0]
+    drop_daily(root, "600518.SH", "20240103")
+    bars = TushareSnapshotProvider(root).fetch_daily_bars(
+        "600518.SH", date(2024, 1, 2), date(2024, 1, 9)
+    )
+    status = dict(zip(bars.trade_date.dt.strftime("%m%d"), bars.bar_status, strict=True))
+    assert status == {
+        "0102": "traded",
+        "0103": "missing",
+        "0104": "suspended",
+        "0105": "traded",
+        "0108": "traded",  # 盘中停牌不吞掉当天真实成交
+        "0109": "traded",
+    }
+    gap = bars[bars.trade_date == "2024-01-03"].iloc[0]
+    assert pd.isna(gap.is_suspended) and pd.isna(gap.volume)
+    confirmed = bars[bars.trade_date == "2024-01-04"].iloc[0]
+    assert bool(confirmed.is_suspended) and confirmed.volume == 0
+
+
+def test_full_day_suspension_with_trades_is_a_conflict(snapshot):
+    root = snapshot[0]
+    path = root / "suspend_d" / "600518.SH.parquet"
+    frame = pd.read_parquet(path)
+    frame.loc[len(frame)] = ["600518.SH", "20240105", None, "S"]
+    frame.to_parquet(path, index=False)
+    bars = TushareSnapshotProvider(root).fetch_daily_bars(
+        "600518.SH", date(2024, 1, 2), date(2024, 1, 9)
+    )
+    row = bars[bars.trade_date == "2024-01-05"].iloc[0]
+    assert row.bar_status == "conflict" and pd.isna(row.is_suspended)
+
+
+def test_delisting_tail_needs_evidence(snapshot):
+    root = snapshot[0]
+    path = root / "suspend_d" / "600001.SH.parquet"
+    frame = pd.read_parquet(path)
+    frame[frame.trade_date != "20240108"].to_parquet(path, index=False)
+    bars = TushareSnapshotProvider(root).fetch_daily_bars(
+        "600001.SH", date(2024, 1, 2), date(2024, 1, 9)
+    )
+    assert bars.bar_status.tolist() == ["traded", "traded", "suspended", "suspended", "missing"]
+    assert bars.trade_date.max() == pd.Timestamp("2024-01-08")  # 不在退市后继续估值
+
+
+def test_export_refuses_gaps_unless_placeholders_are_explicit(snapshot, monkeypatch, tmp_path):
+    root = snapshot[0]
+    drop_daily(root, "600518.SH", "20240103")
+    monkeypatch.setenv("TUSHARE_SNAPSHOT_DIR", str(root))
+    monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
+    export = ["export", "--provider", "tushare", "--codes", "600518.SH"]
+    export += ["--start", "2024-01-02", "--end", "2024-01-09", "--target", "quant-research-lab"]
+    assert main([*export, "--output", str(tmp_path / "strict")]) == 1
+    assert main([*export, "--allow-gap-placeholders", "--output", str(tmp_path / "loose")]) == 0
+    report = json.loads((tmp_path / "loose" / "export_report.json").read_text())
+    assert report["gap_placeholder_rows"] == 1
+    assert report["gap_placeholders"] == {"600518.SH": ["2024-01-03"]}
+    bars = pd.read_csv(tmp_path / "loose" / "bars.csv")
+    placeholder = bars[bars.trade_date.str.startswith("2024-01-03")].iloc[0]
+    assert bool(placeholder.is_suspended)  # 下游不可成交，但报告写明这是缺口占位而非确认停牌
+    quality = report["quality_issues"]["600518.SH"]
+    assert any(
+        item["kind"] == "unverified_gap" and "2024-01-03" in item["detail"] for item in quality
+    )

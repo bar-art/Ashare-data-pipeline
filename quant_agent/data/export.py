@@ -38,7 +38,47 @@ def _fill_suspended_volume(frame: pd.DataFrame) -> tuple[pd.DataFrame, int]:
     return result, int(mask.sum())
 
 
+def resolve_gaps(
+    frame: pd.DataFrame, allow_placeholders: bool
+) -> tuple[pd.DataFrame, dict[str, list[str]]]:
+    """缺口行（无行情也无停牌证据）默认保持未知，导出会拒绝。
+
+    显式允许时，缺口行改为不可成交的估值占位（is_suspended=True，沿用上一估值），
+    bar_status 仍为 missing，并逐证券记录日期；这不是"确认停牌"。来源矛盾（conflict）不放行。
+    """
+    result = frame.copy()
+    status = (
+        result["bar_status"] if "bar_status" in result else pd.Series(pd.NA, index=result.index)
+    )
+    gaps = (status == "missing").fillna(False).astype(bool)
+    placeholders = {
+        str(code): sorted(pd.to_datetime(group["trade_date"]).dt.strftime("%Y-%m-%d"))
+        for code, group in result[gaps].groupby("ts_code")
+    }
+    if allow_placeholders and gaps.any():
+        result.loc[gaps, "is_suspended"] = True
+    return result, placeholders if allow_placeholders else {}
+
+
 def _require_known(frame: pd.DataFrame, columns: list[str]) -> None:
+    if "bar_status" in frame:
+        unresolved = frame["is_suspended"].isna() & frame["bar_status"].isin(
+            ["missing", "conflict"]
+        )
+    else:
+        unresolved = pd.Series(False, index=frame.index)
+    if unresolved.any():
+        unknown = frame[unresolved]
+        sample = [
+            f"{code} {pd.Timestamp(day).date()}（{state}）"
+            for code, day, state in unknown[["ts_code", "trade_date", "bar_status"]]
+            .head(5)
+            .itertuples(index=False)
+        ]
+        raise ValueError(
+            f"{len(unknown)} 行既无行情也无停牌证据或来源矛盾：{'; '.join(sample)}；"
+            "可核对来源，或显式加 --allow-gap-placeholders 导出为不可成交的估值占位"
+        )
     for column in columns:
         missing = int(frame[column].isna().sum())
         if missing:
@@ -69,11 +109,13 @@ def to_quant_research_lab(
     output: Path,
     mode: PriceMode = "hfq",
     universe: pd.Series | None = None,
+    allow_gap_placeholders: bool = False,
 ) -> dict[str, Any]:
     """写 bars.csv 与 manifest.json（quant-research-lab 的 research 命令输入）。
 
     universe：与 frame 同索引的逐行股票池资格；提供时写入 universe_member 列。
     """
+    frame, placeholders = resolve_gaps(frame, allow_gap_placeholders)
     frame, filled = _fill_suspended_volume(frame)
     _require_known(frame, ["is_suspended", "open", "high", "low", "close", "volume"])
     data = _scaled(frame, mode)
@@ -114,13 +156,25 @@ def to_quant_research_lab(
         "suspended_volume_filled_zero": filled,
         "universe_member_rows": None if universe is None else int(universe.sum()),
         **export_summary(frame),
+        **_placeholder_summary(placeholders),
+    }
+
+
+def _placeholder_summary(placeholders: dict[str, list[str]]) -> dict[str, Any]:
+    return {
+        "gap_placeholder_rows": sum(len(days) for days in placeholders.values()),
+        "gap_placeholders": placeholders,
     }
 
 
 def to_alpha_evidence_lab(
-    frame: pd.DataFrame, output: Path, mode: PriceMode = "hfq"
+    frame: pd.DataFrame,
+    output: Path,
+    mode: PriceMode = "hfq",
+    allow_gap_placeholders: bool = False,
 ) -> dict[str, Any]:
     """每只股票一个 CSV；保留停牌和涨跌停字段，不压缩真实交易时间轴。"""
+    frame, placeholders = resolve_gaps(frame, allow_gap_placeholders)
     _require_known(frame, ["is_suspended", "open", "close"])
     data = _scaled(frame, mode)
     output.mkdir(parents=True, exist_ok=True)
@@ -150,4 +204,5 @@ def to_alpha_evidence_lab(
         "suspended_rows_dropped": dropped,
         "note": "同一市场的多只股票相关，不是独立价格路径；独立性需研究者另行论证。",
         **export_summary(frame),
+        **_placeholder_summary(placeholders),
     }

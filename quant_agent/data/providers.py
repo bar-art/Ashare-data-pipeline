@@ -218,6 +218,8 @@ class BaoStockProvider:
         frame["adj_factor"] = frame["hfq_close"] / frame["close"]
         status = {"1": False, "0": True}
         frame["is_suspended"] = frame["tradestatus"].map(status).astype("boolean")
+        # BaoStock 逐日给出交易状态，停牌行由来源确认。
+        frame["bar_status"] = frame["is_suspended"].map({True: "suspended", False: "traded"})
         frame["is_st"] = frame["isST"].map({"1": True, "0": False}).astype("boolean")
         return normalize(frame.drop(columns=["code", "tradestatus", "isST", "hfq_close"]), code)
 

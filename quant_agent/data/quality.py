@@ -72,6 +72,14 @@ def quality_report(
         int(((frame.high > frame.up_limit + 0.005) | (frame.low < frame.down_limit - 0.005)).sum()),
         "超出来源涨跌停价格",
     )
+    if "bar_status" in frame:
+        status = frame["bar_status"].astype("string")
+        for state, kind, note in [
+            ("missing", "unverified_gap", "既无行情也无停牌证据，不当作停牌"),
+            ("conflict", "status_conflict", "有全天停牌记录却有成交"),
+        ]:
+            dates = pd.to_datetime(frame.loc[(status == state).fillna(False), "trade_date"])
+            add(kind, len(dates), f"{note}：" + ", ".join(dates.dt.strftime("%Y-%m-%d")))
     factors = frame.adj_factor.dropna().astype(float)
     add(
         "invalid_adj_factor",
