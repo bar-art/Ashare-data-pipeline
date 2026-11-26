@@ -3,9 +3,9 @@ requires = ["setuptools>=75"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "a-share-quant-agent"
+name = "ashare-data-pipeline"
 version = "0.1.0"
-description = "A股量化研究工具，第一阶段数据基础设施"
+description = "A股历史数据的整理、核对与导出"
 requires-python = ">=3.11"
 dynamic = ["dependencies"]
 [project.scripts]

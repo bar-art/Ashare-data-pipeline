@@ -1,11 +1,16 @@
-# A-share Quant Research Agent
+# ashare-data-pipeline
 
-面向 A 股的量化研究项目。当前完成范围为**第一阶段：数据基础设施与小样本**。后续分阶段增加历史股票池、PIT、回测、因子、风险报告和 LLM。仅供研究，不构成投资建议。
+[![tests](https://github.com/bar-art/ashare-data-pipeline/actions/workflows/tests.yml/badge.svg)](https://github.com/bar-art/ashare-data-pipeline/actions/workflows/tests.yml)
+
+整理、核对和导出 A 股历史数据，供回测使用：按时点的历史指数成分（含已退市证券）、有来源证据的停牌、ST、昨收、按板块规则计算的涨跌停价，以及可校验的本地快照。导出格式供 [quant-research-lab](https://github.com/bar-art/quant-research-lab) 和 [alpha-evidence-lab](https://github.com/bar-art/alpha-evidence-lab) 使用。仅供研究，不构成投资建议。
+
+（仓库原名 a-share-quant-agent；Python 包名 `quant_agent` 和命令 `quant-agent` 保持不变。）
 
 ## 安装（Python 3.11+）
 
 ```bash
-cd a-share-quant-agent
+git clone https://github.com/bar-art/ashare-data-pipeline.git
+cd ashare-data-pipeline
 python3.11 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.lock

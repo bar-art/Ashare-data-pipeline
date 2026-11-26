@@ -312,6 +312,10 @@ def test_export_contract_with_actual_downstream_importers(provider, tmp_path, mo
     from pathlib import Path
 
     workspace = Path(__file__).resolve().parents[2]
+    # 跨项目契约测试只在三个仓库并列检出时运行；单独克隆（如 CI）时跳过。
+    for sibling in ["quant-research-lab", "alpha-evidence-lab"]:
+        if not (workspace / sibling / "src").is_dir():
+            pytest.skip(f"未找到相邻仓库 {sibling}，跳过跨项目契约测试")
     monkeypatch.syspath_prepend(str(workspace / "quant-research-lab" / "src"))
     monkeypatch.syspath_prepend(str(workspace / "alpha-evidence-lab" / "src"))
     from alpha_evidence_lab.data import load_csv
